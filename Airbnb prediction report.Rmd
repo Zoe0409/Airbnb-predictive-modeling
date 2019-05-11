@@ -1,0 +1,781 @@
+---
+title: "Kaggle Competition: How much for your Airbnb?"
+author: "Zichen (Zoe) Huang"
+date: "Dec 3, 2018"
+output: 
+  html_document: 
+    fig_caption: yes
+    fig_height: 7
+    fig_width: 7
+    toc: yes
+---
+ 
+```{r setup, include=FALSE}
+library(naniar)
+library(ggplot2)
+library(corrplot)
+library(plyr)
+library(base)
+library(tidyr)
+library(caret)
+library(e1071)
+library(xgboost)
+library(Metrics)
+library(stringr)
+library(tidytext)
+library(dplyr)
+library(ModelMetrics)
+library(randomForest)
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Read data 
+Read data including **analysisData** and **scoringData**.
+```{r echo=TRUE}
+# set working direction
+setwd('/Users/Zoe/Desktop/Columbia University /Courses/APAN5200/Assignment/Kaggle Competition/Raw data')
+data = read.csv('analysisData.csv')
+testing = read.csv('scoringData.csv')
+```
+# Combine train and test datasets
+Deal with train dataset by removing record of **Uruguay** and records the price of which equals to zero. Then combine train and test datasets so that we can operate on these two datasets in the same way altogether.
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Remove record of Uruguay which is not useful for a model to predict house price in NY
+data <- data[-4568,]
+# Deal with price_zero
+sum(data$price == 0)
+data<-data[!(data$price == 0),]
+# Remove the taget variable from train data and combine train and test datasets
+SalePrice = data$price
+data <- data[,-61]
+fulldata <- rbind(data,testing)
+```
+# Data cleansing, build what is needed
+### Understand data
+```{r echo=TRUE}
+# Before imputing the missing value, take a look at the whole dataset to understand the structure
+str(fulldata)
+# Look at column names
+names(fulldata)
+```
+### Impute missing value
+Looking at the number of missing values and taking a closer look at the data description, we can see that NA does not always mean that the values are missing. e.g.: In case of the feature *"beds","cleaning_fee","security_deoposit"*, NA just means that there is *"no beds"/"no cleaning_fee"/"no security_deoposit"* in the room. Since I will use advanced tree, I just code such NA values to say -1.
+```{r echo=TRUE}
+# finding missing data
+sort(sapply(fulldata, function(x) {sum(is.na(x))}), decreasing = F)
+# Visualize missing values of data
+gg_miss_var(fulldata)
+# Remove variables with only missing value as well as zipcode which I will use another variable to represent location information:
+variables_to_romove0 <- c("xl_picture_url","thumbnail_url","medium_url","license","zipcode")
+fulldata <- fulldata[,!colnames(fulldata) %in% variables_to_romove0, drop=F] 
+# For these categorical variables with high propotion of missing value, I use whether there is a value or not to differentiate them by coding missing value to be 0, and other values to be 1.
+## monthly_price
+fulldata <- fulldata %>%
+  mutate(monthly_price_new = case_when(
+    monthly_price > 0 ~ 'with monthly price',
+    TRUE ~ "without monthly price"))
+fulldata$monthly_price <- NULL
+## square_feet
+fulldata <- fulldata %>%
+  mutate(square_feet_new = case_when(
+    square_feet > 0 ~ 'with square feet',
+    TRUE ~ "without square feet"))
+fulldata$square_feet <- NULL
+## weekly_price
+fulldata <- fulldata %>%
+  mutate(weekly_price_new = case_when(
+    weekly_price > 0 ~ 'with weekly price',
+    TRUE ~ "without weekly price"))
+fulldata$weekly_price <- NULL
+## security_deposit
+fulldata <- fulldata %>%
+  mutate(security_deposit_new = case_when(
+    security_deposit > 0 ~ 'with security deposit',
+    TRUE ~ "without security deposit"))
+fulldata$security_deposit <- NULL
+# Convert character columns to factor, filling NA values with "missing"
+for (col in colnames(fulldata)){
+  if (typeof(fulldata[,col]) == "character"){
+    new_col = fulldata[,col]
+    new_col[is.na(new_col)] = "missing"
+    fulldata[col] = as.factor(new_col)
+  }
+}
+# Fill remaining NA values with -1
+fulldata[is.na(fulldata)] = -1
+```
+### Explore Dataset Variables
+**1. Variance of each variable:** If any variable has zero variance, then we would consider removing that feature.
+```{r echo=TRUE, warning=FALSE}
+# Take a look at the variance of each variable
+nearZeroVar(data, saveMetrics = TRUE)
+# Remove variables with zero variance:
+variables_to_romove1 <- c("scrape_id", "experiences_offered", "thumbnail_url", " medium_url", "xl_picture_url", "host_acceptance_rate", "has_availability", "requires_license", "license","country_code","country")
+fulldata <- fulldata[,!colnames(fulldata) %in% variables_to_romove1, drop=F]
+```
+**2. Categorical variables about location:** Remove categorical variables about location with too many different levels or typos, and leave *"neighbourhood_group_cleansed"* which is clean.
+```{r echo=TRUE}
+# Remove categorical variables about location and leave "neighbourhood_group_cleansed":
+variables_to_romove2 <- c("neighbourhood","neighbourhood_cleansed","jurisdiction_names","street","city","state","market","smart_location","longitude","is_location_exact")
+fulldata <- fulldata[,!colnames(fulldata) %in% variables_to_romove2, drop=F]
+```
+**3. Host information:** Remove variables about host basic information which is not related to the room directly.
+```{r echo=TRUE}
+variables_to_romove3 <- c("host_location","host_id","host_url","host_name","host_thumbnail_url","host_picture_url","host_verifications","host_neighbourhood")
+fulldata <- fulldata[,!colnames(fulldata) %in% variables_to_romove3, drop=F]
+```
+**4. URL variables:** Remove useless url variables which have no contribution to prediction of price.
+```{r echo=TRUE}
+variables_to_romove4 <- c("listing_url","picture_url")
+fulldata <- fulldata[,!colnames(fulldata) %in% variables_to_romove4, drop=F]
+```
+**5. Self-related variables:** Determine whether any of the numeric variables are highly correlated with one another. A cutoff that I usually use is +-0.7, but since we will be using a tree-based model, we deal with variables with correlations above 0.9 only.
+```{r echo=TRUE}
+# Correlations of numeric data to check for bivariate correlations
+nums <- sapply(fulldata, is.numeric)
+corrplot(cor(fulldata[,nums]),method = 'square',type = 'lower',diag = F)
+# Remove "availability_30","availability_60","availability_90" because they related to each other
+variables_to_romove5 <- c("availability_30","availability_60","availability_90")
+fulldata <- fulldata[,!colnames(fulldata) %in% variables_to_romove5, drop=F]
+```
+**6. Date-related variables:** Remove date-related variables with too many levels
+```{r echo=TRUE}
+variables_to_romove6 <- c("last_scraped","host_since","calendar_last_scraped")
+fulldata <- fulldata[,!colnames(fulldata) %in% variables_to_romove6, drop=F]
+```
+**7. first_review & last_review:** see if the difference between last review and first review is greater than one year
+```{r echo=TRUE}
+f <- as.Date(fulldata$first_review)
+l <- as.Date(fulldata$last_review)
+fulldata <- fulldata %>%
+  mutate(review_diff = ifelse(l-f < 365, T, F))
+fulldata$first_review <- NULL
+fulldata$last_review <- NULL
+```
+### Data Preparation
+**0. Function preparation**
+```{r echo=TRUE}
+# Function: Looking for Keyword
+keyword.look <- function(x){
+  keywords <- data_frame(x)
+  keywords %>%
+    unnest_tokens(words, x)
+}
+# Function: Extract keyword
+keyword.detect <- function(x,key){
+  fulldata <- mutate(fulldata, x = grepl(paste(pattern = key, collapse = "|"),  x = x))
+}
+# Function: Derive the length
+length.impact <- function(x){
+  fulldata <- fulldata %>%
+    mutate(x_impact = case_when(str_length(x) == 0 |
+                                  str_length(x) < mean(str_length(x) ) ~ "short/no description",
+                                TRUE ~ "Good description"))
+}
+```
+**1. Calendar_updated**
+```{r echo=TRUE}
+fulldata <- fulldata %>%
+  mutate(calendar_updated_daysago = case_when(
+    grepl("today", calendar_updated) ~ 0,
+    grepl("yesterday", calendar_updated) ~ 1,
+    grepl("a week ago", calendar_updated) ~ 7,
+    grepl("never", calendar_updated) ~ 52 * (365 / 12),
+    grepl("day", calendar_updated) ~ as.numeric(str_extract(calendar_updated, "^[0-9]*")),
+    grepl("week", calendar_updated) ~ as.numeric(str_extract(calendar_updated, "^[0-9]*")) * 7,
+    grepl("month", calendar_updated) ~ as.numeric(str_extract(calendar_updated, "^[0-9]*")) * (365 / 12)
+  ))
+fulldata$calendar_updated <- NULL
+```
+**2. Name**
+```{r echo=TRUE}
+# Detect the key words for Name
+#keyword.look(fulldata$name) #COZY, SPACIOUS,EASY ACCESS
+# Extract keyword_name from name
+keyword_name <- c('cozy','spacious','easy access')
+fulldata <- fulldata %>%
+  mutate(name_keyword = grepl(paste(pattern = keyword_name, collapse = "|"), ignore.case = T, x = fulldata$name))
+# See the impact if there's penalty of not putting any names or short (less than avg)
+fulldata <- fulldata %>%
+  mutate(name_impact = case_when(
+    str_length(fulldata$name) == 0 |
+      str_length(fulldata$name) < mean(str_length(fulldata$name) ) ~ "short/no Name",
+    TRUE ~ "Good Name"
+  ))
+fulldata$name <- NULL
+```
+**3. Access**
+```{r echo=TRUE}
+# lf there's penalty of not putting any access or short (less than avg)
+fulldata <- fulldata %>%
+  mutate(access_impact = case_when(
+    str_length(fulldata$access) == 0 |
+      str_length(fulldata$access) <  mean(str_length(fulldata$access)) ~ 'short/no access',
+    TRUE ~ 'Long access'))
+fulldata$access <- NULL
+```
+**4. Summary**
+```{r echo=TRUE}
+#attraction sights 20
+attraction <-c('SoHo','Chelsea',"Statue of Liberty","Central Park","Rockefeller Center","Metropolitan Museum","Broadway","Theater","Museum","Bride","Empire State","9/11","High Line","Time Square","Fifth Ave","Grand Central Terminal","One World Observatory","Frick Collection","New York Public Library","Wall Street"," Radio City Music Hall"," St Patrick's Cathedral","Carnegie Hall","Bryant Park")
+#convenenece
+convenience <-c("train", "walking", 'walk', 'shopping', 'mall', 'min', 'minutes', 'shop','shops','restaurant','subway')
+#MYwords
+mywords <- c("safe","train","subways","subway","transportation", 'bar','bars','convinenient','parking','available','cool','awesome','clean', 'new', 'best','plaza','close','lovely','quiet','food')
+#keyword.look(fulldata$summary)#perfect,spot, intern, student
+#Attractions
+keyword.detect(fulldata$summary, attraction)
+fulldata <- fulldata %>%
+  mutate(summary_attraction = grepl(paste(pattern = attraction, collapse = "|"),ignore.case = T,  x = fulldata$summary))
+#Keywords
+keyword_summary <- c('student','intern','perfect')
+fulldata <- fulldata %>%
+  mutate(summary_keyword = grepl(paste(pattern = keyword_summary, collapse = "|"),  ignore.case = T,x = fulldata$summary))
+#Mywords
+fulldata <- fulldata %>%
+  mutate(summary_myword =  grepl(paste(pattern = mywords, collapse = "|"),ignore.case = T,  x = fulldata$summary))
+#convenience
+fulldata <- fulldata %>%
+  mutate(summary_convenience =  grepl(paste(pattern = convenience, collapse = "|"),  ignore.case = T,x = fulldata$summary))
+#See the impact of detailed description.
+fulldata <- fulldata %>%
+  mutate(summary_impact = case_when(
+    str_length(fulldata$summary) == 0 |
+      str_length(fulldata$summary) <mean(str_length(fulldata$summary)) ~ 'short/no Summary',
+    TRUE ~ 'Long Summary'))
+fulldata$summary <- NULL
+```
+**5. Space**
+```{r echo=TRUE}
+#Look for Key words
+#keyword.look(fulldata$space) #private
+#"PRIVATE"
+fulldata <- fulldata %>%
+  mutate(space_keyword = grepl('private',  x = fulldata$space))
+#See the impact of detailed description.
+fulldata <- fulldata %>%
+  mutate(space_impact = case_when(
+    str_length(fulldata$space) == 0 |
+      str_length(fulldata$space) <mean(str_length(fulldata$space)) ~ 'short/no Summary',
+    TRUE ~ 'Long Summary'))
+fulldata$space <- NULL
+```
+**6. Description**
+```{r echo=TRUE}
+#Keywords
+#keyword.look(fulldata$description) #student, intern, perfect
+#Attractions
+#keyword.detect(fulldata$summary, attraction)
+fulldata <- fulldata %>%
+  mutate(description_attraction = grepl(paste(pattern = attraction, collapse = "|"),  ignore.case = T,x = fulldata$description))
+#Keywords
+keyword_summary <- c('student','intern','perfect')
+fulldata <- fulldata %>%
+  mutate(description_keyword = grepl(paste(pattern = keyword_summary, collapse = "|"), ignore.case = T, x = fulldata$description))
+#Mywords
+fulldata <- fulldata %>%
+  mutate(description_myword =  grepl(paste(pattern = mywords, collapse = "|"), ignore.case = T, x = fulldata$description))
+#convenience
+fulldata <- fulldata %>%
+  mutate(description_convenience =  grepl(paste(pattern = convenience, collapse = "|"), ignore.case = T, x = fulldata$description))
+#See the impact of detailed description.
+fulldata <- fulldata %>%
+  mutate(description_impact = case_when(
+    str_length(fulldata$description) == 0 |
+      str_length(fulldata$description) <mean(str_length(fulldata$description)) ~ 'short/no Summary',
+    TRUE ~ 'Long Summary'))
+fulldata$description <- NULL
+```
+**7. Neighborhood**
+```{r echo=TRUE}
+#Keywords
+#keyword.look(fulldata$neighborhood_overview)#indian, food
+#Attraction
+fulldata <- fulldata %>%
+  mutate(neighborhood_overview_attraction = grepl(paste(pattern = attraction, collapse = "|"),  ignore.case = T,x = fulldata$neighborhood_overview))
+#Keywords
+keyword_neighborhood_overview<- c('indian', 'food')
+fulldata <- fulldata %>%
+  mutate(neighborhood_overview_keyword = grepl(paste(pattern = keyword_neighborhood_overview, collapse = "|"),ignore.case = T,  x = fulldata$neighborhood_overview))
+#Mywords
+fulldata <- fulldata %>%
+  mutate(neighborhood_overview_myword =  grepl(paste(pattern = mywords, collapse = "|"),  ignore.case = T, x = fulldata$neighborhood_overview))
+#convenience
+fulldata <- fulldata %>%
+  mutate(neighborhood_overview_convenience =  grepl(paste(pattern = convenience, collapse = "|"), ignore.case = T, x = fulldata$neighborhood_overview))
+#See the impact of detailed description.
+fulldata <- fulldata %>%
+  mutate(neighborhood_overview_impact = case_when(
+    str_length(fulldata$neighborhood_overview) == 0 |
+      str_length(fulldata$neighborhood_overview) <mean(str_length(fulldata$neighborhood_overview)) ~ 'short/no Summary',
+    TRUE ~ 'Long Summary'))
+fulldata$neighborhood_overview <- NULL
+```
+**8. Interaction**
+```{r echo=TRUE}
+# See the impact of detailed Interaction
+fulldata <- fulldata %>%
+  mutate(interaction_impact = case_when(
+    str_length(fulldata$interaction) == 0 |
+      str_length(fulldata$interaction) < mean(str_length(fulldata$interaction)) ~ 'short/no description',
+    TRUE ~ 'Good description'))
+fulldata$interaction <- NULL
+```
+**9. Transit**
+```{r echo=TRUE}
+#Keywords
+#keyword.look(fulldata$transit) #parking, limited, near'
+transit_keyword <- c('parking','limited')
+fulldata <- fulldata %>%
+  mutate(transit_keyword = grepl('limited', ignore.case = T, x = fulldata$transit))
+#convenience
+fulldata <- fulldata %>%
+  mutate(transit_convenience =  grepl(paste(pattern = convenience, collapse = "|"), ignore.case = T,  x = fulldata$transit))
+#See the impact of detailed description.
+fulldata <- fulldata %>%
+  mutate(neighborhood_overview_impact = case_when(
+    str_length(fulldata$transit) == 0 |
+      str_length(fulldata$transit) <mean(str_length(fulldata$transit)) ~ 'short/no Summary',
+    TRUE ~ 'Long Summary'))
+fulldata$transit <- NULL
+```
+**10. Notes**
+```{r echo=TRUE}
+#Keywords
+#keyword.look(fulldata$notes) #extremely, border,
+#Mywords
+#Attraction
+fulldata <- fulldata %>%
+  mutate(notes_attraction = grepl(paste(pattern = attraction, collapse = "|"),  ignore.case = T,x = fulldata$notes))
+#Mywords
+fulldata <- fulldata %>%
+  mutate(notes_myword =  grepl(paste(pattern = mywords, collapse = "|"),  ignore.case = T, x = fulldata$notes))
+#convenience
+fulldata <- fulldata %>%
+  mutate(notes_convenience =  grepl(paste(pattern = convenience, collapse = "|"), ignore.case = T, x = fulldata$notes))
+#See the impact of detailed description.
+fulldata <- fulldata %>%
+  mutate(notes_impact = case_when(
+    str_length(fulldata$notes) == 0 |
+      str_length(fulldata$notes) <mean(str_length(fulldata$notes)) ~ 'short/no Summary',
+    TRUE ~ 'Long Summary'))
+fulldata$notes <- NULL
+```
+**11. House Rules**
+```{r echo=TRUE}
+#House Rules
+fulldata <- fulldata %>%
+  mutate(rules_keyword = grepl('no',  ignore.case = T,x = fulldata$house_rules))
+#Good description
+fulldata <- fulldata %>%
+  mutate(rules_impact = case_when(str_length(fulldata$house_rules) == 0 |
+                                    str_length(fulldata$house_rules) < mean(str_length(fulldata$house_rules)) ~ "Short/No description",
+                                  TRUE ~ "Good description"))
+fulldata$house_rules <- NULL
+```
+**12. Amenities**
+```{r echo=TRUE}
+fulldata <- mutate(fulldata, amenities_impact = str_count(amenities, ','))
+# Decorate amenities
+## amenities_impact_new <- c("Advanced","Based")
+fulldata <-fulldata %>%
+  mutate(amenities_impact_new = case_when(amenities_impact > 65 ~"Advanced",
+                                          TRUE ~ "Basic"))
+fulldata$amenities <- NULL
+fulldata$amenities_impact <- NULL
+```
+**13. Property_type**
+```{r echo=TRUE}
+## new property_type <- c("Apartment", "House", "Condo", "Loft")
+fulldata <-fulldata %>%
+  mutate(property_type_new = case_when(property_type == "Apartment" ~"Apartment",
+                                       property_type == "House" ~ "House",
+                                       property_type == "Condominium" ~ "Condo",
+                                       property_type == "Loft"  ~ "Loft",
+                                       TRUE ~ "Rest"))
+fulldata$property_type <- NULL
+```
+**14. Host_about**
+```{r echo=TRUE}
+#Having description on host_about
+fulldata <- fulldata %>%
+  mutate(selfintro_impact = case_when(str_length(fulldata$host_about) == 0  ~ 0,
+                                      TRUE ~ 1))
+fulldata$host_about <- NULL
+```
+**15. Rating**
+```{r echo=TRUE}
+fulldata$review_scores_checkin <- NULL
+fulldata$review_scores_cleanliness <- NULL
+fulldata$review_scores_communication <- NULL
+fulldata$review_scores_location <- NULL
+fulldata$review_scores_accuracy <- NULL
+fulldata$review_scores_value <- NULL
+```
+**16. host_response_rate**
+```{r echo=TRUE}
+fulldata <-fulldata %>%
+  mutate(host_response_rate_new = case_when(host_response_rate %in% c("100%","99%","98%","97%","96%","95%","94%","93%","92%","91%","90%","89%","88%","87%","86%","95%","84%","83%","82%","81%","80%") ~"Excellent",
+                                            host_response_rate == "N/A" ~ "Not Applicapable",
+                                            host_response_rate %in% c("0%","10%","11%","12%","13%","14%","15%","16%","17%","18%","19%","20%") ~ "Bad",
+                                            TRUE ~ "Rest"))
+fulldata$host_response_rate <- NULL
+```
+**17. host_response_time**
+```{r echo=TRUE}
+fulldata <-fulldata %>%
+  mutate(host_response_time_new = case_when(host_response_time == "N/A" ~ "Not Applicapable",
+                                            TRUE ~ "Rest"))
+fulldata$host_response_time <- NULL
+```
+### Transform those values with high skewness-
+```{r echo=TRUE}
+classes <- lapply(fulldata,function(x) class(x))
+numeric_feats <- names(classes[classes=="integer" | classes=="numeric"])
+skewed_feats <- sapply(numeric_feats, function(x) skewness(fulldata[[x]]))
+skewed_feats <- skewed_feats[abs(skewed_feats) > .75]; skewed_feats
+## We can take log transformation of features or other approaches for which skewness more than 0.75 but here I just skipped this step because normalization is not neccessary for advanced trees
+```
+### Split combined full dataset into train and test datasets
+```{r echo=TRUE}
+# Convert character columns to factor
+for (col in colnames(fulldata)){
+  if (typeof(fulldata[,col]) == "character"){
+    fulldata[col] = as.factor(fulldata[,col])
+  }
+}
+# Split combined full dataset into train and test datasets
+train <- fulldata[1 : nrow(data),]
+test <- fulldata[nrow(data) + 1 : nrow(testing),]
+# Add SalePrice back to train dataset
+train <- cbind(train, SalePrice)
+train$id = NULL
+```
+# Further operation on variables left now
+1. Check which variables left, and track outliers.
+```{r echo=TRUE}
+# Track outliers
+ggplot(train,aes(x=bathrooms,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar')
+train[train$bathrooms>6,]$bathrooms <- mean(train$bathrooms)%>%as.numeric
+ggplot(train,aes(x=bedrooms,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar')
+train[train$bedrooms>10,]$bedrooms <- mean(train$bedrooms)%>%as.numeric
+ggplot(train,aes(x=beds,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar')
+train[train$beds>20,]$beds <- mean(train$beds)%>%as.numeric
+ggplot(train,aes(x=cleaning_fee,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar')
+train[train$cleaning_fee>420,]$cleaning_fee <- mean(train$cleaning_fee)%>%as.numeric
+```
+2. Variance of each variable: If any did have zero variance, then we would consider removing that feature. For those variables with near zero variance, we can take a look at their impact on SalePrice one by one from visualized bar chart.
+```{r echo=TRUE}
+# Take a look at the variance of each variable
+nearZeroVar(train, saveMetrics = TRUE)
+# Visualized bar chart
+ggplot(train,aes(x=host_has_profile_pic,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=bed_type,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=require_guest_profile_picture,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #F
+ggplot(train,aes(x=require_guest_phone_verification,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=amenities_impact_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=monthly_price_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=square_feet_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=description_myword,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=transit_keyword,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=notes_attraction,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+# Remove some variables without contribution to price prediction
+train$require_guest_profile_picture <- NULL
+```
+3. Remove numeric variables with low correration with SalePrice
+```{r echo=TRUE}
+# Check the correlation of numeric variables with price
+for (col in colnames(train)){
+  if(is.numeric(train[,col])){
+    if( abs(cor(train[,col],train$SalePrice)) < 0.1){
+      print(col)
+      print( cor(train[,col],train$SalePrice) )
+    }
+  }
+}
+# Remove some numeric variables with low correration with SalePrice
+train$host_listings_count <- NULL
+train$host_total_listings_count <- NULL
+train$latitude <- NULL
+train$minimum_nights <- NULL
+train$maximum_nights <- NULL
+train$availability_365 <- NULL
+train$number_of_reviews <- NULL
+train$review_scores_rating <- NULL
+train$calculated_host_listings_count <- NULL
+train$reviews_per_month <- NULL
+train$calendar_updated_daysago <- NULL
+train$selfintro_impact <- NULL
+```
+4. Check which variables left, and visualize the relationship between each independent variable and dependent variable. Since we have already dealt with numeric variables, we should pay more attention to categorical variables this time.
+```{r echo=TRUE}
+# Check which factor variables left
+for (col in colnames(train)){
+  if(is.factor(train[,col])){
+    print(col)
+  }
+}
+# Visualized bar chart
+ggplot(train,aes(x=host_response_time_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=host_is_superhost,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=host_identity_verified,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=host_has_profile_pic,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=neighbourhood_group_cleansed,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=room_type,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=bed_type,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=instant_bookable,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=is_business_travel_ready,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=cancellation_policy,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=require_guest_phone_verification,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=monthly_price_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=square_feet_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=security_deposit_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=name_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=access_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=summary_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #F
+ggplot(train,aes(x=space_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=description_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=neighborhood_overview_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #F
+ggplot(train,aes(x=interaction_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=notes_impact,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #F
+ggplot(train,aes(x=amenities_impact_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=property_type_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+ggplot(train,aes(x=host_response_rate_new,y=SalePrice)) +
+  stat_summary(fun.y=mean, geom='bar') #T
+# Remove some variables with no obvious difference between two different levels
+train$summary_impact <- NULL
+train$notes_impact <- NULL
+```
+# Model building and evaluation
+```{r echo=TRUE}
+# Split train dataset into train_inner and test_inner
+set.seed(123)
+in_train <- createDataPartition(train$SalePrice, p=0.7, list=F)
+train_inner <- train[in_train,]
+test_inner <- train[-in_train,]
+```
+With the constrains of time, below just list several different model and their codes. The corresponding results have been omitted.
+
+**(a). MLR**
+```{r echo = T, results = 'hide'}
+# Create model: First include all predictor variables to see what will happen
+mlr <-lm(formula = SalePrice~.,data = train_inner)
+# Evaluation of model
+getOption("max.print")
+options(max.print = 2000)
+summary(mlr)
+train_prediction_1<- predict(mlr,test_inner)
+rmse_a = sqrt(mean((train_prediction_1 - test_inner$SalePrice)^2))
+rmse_a
+# Read in scoring data and apply model to generate predictions scoringData
+test_predictions_1 = predict(mlr, newdata=test)
+# Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_1)
+write.csv(submissionFile, 'submission_MLR.csv',row.names = F)
+```
+**(b). Decision Trees**
+```{r eval=F, echo=T}
+# Create model
+modfit <- train(SalePrice ~.,method="rpart",data=train_inner)
+# Evaluation of model
+train_prediction_2 <- predict(modfit,data =test_inner)
+rmse_b = sqrt(mean((train_prediction_2 - test_inner$SalePrice)^2))
+rmse_b
+# Read in scoring data and apply model to generate predictions scoringData
+test_predictions_2 = predict(modfit, newdata=test)
+# Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_2)
+write.csv(submissionFile, 'submission_DecisionTree.csv',row.names = F)
+```
+**(c). Random Forest Regression Model**
+```{r eval=F, echo=T}
+# Create model
+rf <- randomForest(SalePrice~.,data = train_inner,ntree=1000, proximity=TRUE)
+# Verify accuracy
+rf $results
+# Take a look at contribution of each variable to make prediction
+varImp(rf)
+# Evaluation of model
+train_prediction_3 <- predict(rf,data =test_inner)
+rmse_c <- sqrt(mean((train_prediction_3 - test_inner$SalePrice)^2))
+rmse_c
+# Read in scoring data and apply model to generate predictions scoringData
+test_predictions_3 = predict(rf, newdata=test)
+# Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_3)
+write.csv(submissionFile, 'submission_RandomForest.csv',row.names = F)
+```
+**(d). Random Forest Regression Model with Cross-validation**
+```{r eval=F, echo=T}
+# Use 10-fold cv to find out optimal value of mtry
+trControl_d=trainControl(method="cv",number=10)
+tuneGrid_d = expand.grid(mtry=1:5)
+# Create model
+set.seed(100)
+cvForest = train(SalePrice~.,data = train_inner, method="rf",ntree=1000,trControl=trControl_d,tuneGrid=tuneGrid_d )
+# Evaluation of model
+train_prediction_4 <- predict(cvForest,test_inner)
+rmse_d=sqrt(mean((train_prediction_4-test_inner$SalePrice)^2))
+rmse_d
+# Read in scoring data and apply model to generate predictions scoringData
+test_predictions_4 = predict(cvForest, newdata=test)
+# Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_4)
+write.csv(submissionFile, 'submission_RandomForest.csv',row.names = F)
+```
+**(e). Regularized Regression(Lasso)**
+```{r eval=F, echo=T}
+## Create model
+tr.control_e <- trainControl(method="repeatedcv", number = 10,repeats = 10)
+lambdas_d <- seq(1,0,-.001)
+set.seed(123)
+lasso_model <- train(SalePrice~., data=train,method="glmnet",metric="RMSE",
+                     maximize=FALSE,trControl=tr.control_e,
+                     tuneGrid=expand.grid(alpha=1,lambda=c(1,0.1,0.05,0.01,seq(0.009,0.001,-0.001), 0.00075,0.0005,0.0001)))
+## Verify accuracy
+lasso_model$results
+## Take a look at contribution of each variable to make prediction
+varImp(lasso_model)
+# Evaluation of model
+train_prediction_5 <- predict(lasso_model,data =train)
+rmse_e <- sqrt(mean((train_prediction_5 - train$SalePrice)^2))
+rmse_e
+## Read in scoring data and apply model to generate predictions scoringData
+test_predictions_5 = predict(lasso_model, newdata=test)
+## Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_5)
+write.csv(submissionFile, 'submission_lasso.csv',row.names = F)
+```
+**(f). Gradient Boosting model(GBM)**
+```{r eval=F, echo=T}
+set.seed(1)
+cv.ctrl_gbm <- trainControl(method="repeatedcv",number=5,repeats = 5)
+gbm<- train(SalePrice~., method = "gbm", metric = "RMSE", maximize = FALSE,
+            trControl =cv.ctrl_gbm, tuneGrid = expand.grid(n.trees = 700,
+                                                           interaction.depth = 5, shrinkage = 0.05,
+                                                           n.minobsinnode = 10), data = train,verbose = FALSE)
+varImp(gbm)
+prediction_6 <- predict(gbm,newdata = train)
+rmse(train$SalePrice,prediction_6)
+rmse
+## Read in scoring data and apply model to generate predictions scoringData
+test_predictions_6 = predict(gbm, newdata=test)
+## Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_6)
+write.csv(submissionFile, 'sample_submission.csv',row.names = F)
+```
+**(g). XGBOOST(Extreme Gradient Boosting)**
+```{r eval=F, echo=T}
+#preparing matrix
+dtrain <- xgb.DMatrix(data = as.matrix(train[,-241]),label = as.matrix(train$SalePrice))
+#Building model
+set.seed(111)
+xgb <-  xgboost(booster="gbtree",data = dtrain, nfold = 5,nrounds = 2500, verbose = FALSE,
+                objective = "reg:linear", eval_metric = "rmse", nthread = 8, eta = 0.01,
+                gamma = 0.0468, max_depth = 6, min_child_weight = 1.41, subsample = 0.769, colsample_bytree =0.283)
+mat <- xgb.importance (feature_names = colnames(dtrain),model = xgb)
+xgb.plot.importance (importance_matrix = mat[1:20])
+prediction_7 <- predict(xgb,newdata = dtrain)
+rmse(train$SalePrice,prediction_7)
+rmse
+## Read in scoring data and apply model to generate predictions scoringData
+test_predictions_7 = predict(xgb, newdata=test)
+## Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_7)
+write.csv(submissionFile, 'submission_xgb.csv',row.names = F)
+```
+**(h). cvBoost with Cross-validation**
+```{r eval=F, echo=T}
+set.seed(100)
+trControl_h = trainControl(method="cv",number=10)
+tuneGrid_h =  expand.grid(n.trees = 1000, interaction.depth = c(1,2),
+                          shrinkage = (1:100)*0.001,n.minobsinnode=5)
+cvBoost = train(SalePrice~.,data = train_inner,method="gbm", trControl=trControl_h, tuneGrid=tuneGrid_h)
+# Check the results of training and which tuning parameters were selected
+cvBoost$results
+cvBoost$bestTune
+# Check which variables ended up being most important to the model
+varImp(cvBoost)
+# Evaluation of model
+train_prediction_8 <- predict(cvBoost,data = train)
+rmse(train$SalePrice,train_prediction_8)
+rmse
+# read in scoring data and apply model to generate predictions scoringData
+test_predictions_8 = predict(cvBoost, newdata=test)
+# construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_8)
+write.csv(submissionFile, 'submission_cvBoost.csv',row.names = F)
+```
+**(i). Ridge Regression Model**
+```{r eval=F, echo=T}
+# Create model
+tr.control_i <- trainControl(method="repeatedcv", number = 10,repeats = 10)
+lambdas_i <- seq(1,0,-.001)
+set.seed(123)
+ridge_model <- train(SalePrice~., data=train, method="glmnet", metric="RMSE",
+                     maximize=FALSE, trControl=tr.control_i,
+                     tuneGrid=expand.grid(alpha=0,lambda=lambdas_i))
+# Verify accuracy
+ridge_model$results
+## Take a look at contribution of each variable to make prediction
+varImp(ridge_model)
+## Evaluation of model
+train_prediction_9 <- predict(ridge_model,data =train)
+rmse(train$SalePrice,train_prediction_9)
+rmse
+## Read in scoring data and apply model to generate predictions scoringData
+test_predictions_9 = predict(ridge_model, newdata=test)
+## Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_9)
+write.csv(submissionFile, 'submission_ridge.csv',row.names = F)
+```
+**(j). Bag**
+```{r eval=F, echo=T}
+set.seed(100)
+bag = randomForest (SalePrice~., data = train)
+## Evaluation of model
+train_prediction_10 <- predict(bag,data =train)
+rmse(train$SalePrice,train_prediction_10)
+## Read in scoring data and apply model to generate predictions scoringData
+test_predictions_10 = predict(bag, newdata=test)
+## Construct submision from predictions
+submissionFile = data.frame(id = test$id, price = test_predictions_10)
+write.csv(submissionFile, 'submission_ridge.csv',row.names = F)
+```
