@@ -1,5 +1,3 @@
-![Hits](https://hitcounter.pythonanywhere.com/count/tag.svg?url=https%3A%2F%2Fgithub.com%2FZoe0409%2FAirbnb-predictive-modeling%2Ftree%2Fmaster)
-
 # Airbnb-predictive-modeling
 
 ## Description
